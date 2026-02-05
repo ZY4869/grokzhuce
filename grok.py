@@ -35,8 +35,8 @@ def get_random_chrome_profile():
         )
     return profile["impersonate"], ua
 PROXIES = {
-    # "http": "http://127.0.0.1:10808",
-    # "https": "http://127.0.0.1:10808"
+    "http": "http://127.0.0.1:7890",
+    "https": "http://127.0.0.1:7890"
 }
 
 # 动态获取的全局变量
@@ -53,6 +53,68 @@ start_time = time.time()
 target_count = 100
 stop_event = threading.Event()
 output_file = None
+
+def _decode_jwt_payload(jwt_token):
+    """解码 JWT payload 部分"""
+    parts = jwt_token.split('.')
+    payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
+    payload = payload.replace('-', '+').replace('_', '/')
+    import base64
+    return json.loads(base64.b64decode(payload))
+
+def _extract_set_cookie_urls(jwt_token, max_depth=5):
+    """从嵌套的 set-cookie JWT 链中提取所有 set-cookie URL"""
+    urls = []
+    current_jwt = jwt_token
+    for _ in range(max_depth):
+        try:
+            data = _decode_jwt_payload(current_jwt)
+            config = data.get("config", {})
+            success_url = config.get("success_url", "")
+            if "set-cookie?q=" in success_url:
+                urls.append(success_url)
+                current_jwt = success_url.split("set-cookie?q=")[1]
+            else:
+                break
+        except Exception:
+            break
+    return urls
+
+def _follow_set_cookie_chain(first_url, impersonate, proxies):
+    """逐一访问 set-cookie URL 链，收集所有域名的 cookie"""
+    all_cookies = {}
+    with requests.Session(impersonate=impersonate, proxies=proxies) as s:
+        # 先访问第一层 URL
+        try:
+            resp = s.get(first_url, allow_redirects=True)
+            for c in s.cookies.jar:
+                if c.name in ("sso", "sso-rw"):
+                    all_cookies[f"{c.name}@{c.domain}"] = c.value
+                    all_cookies[c.name] = c.value
+        except Exception:
+            pass
+
+        # 从第一层 JWT 中解码出后续的 set-cookie URLs
+        jwt_token = first_url.split("set-cookie?q=")[1] if "set-cookie?q=" in first_url else ""
+        if jwt_token:
+            nested_urls = _extract_set_cookie_urls(jwt_token)
+            for url in nested_urls:
+                try:
+                    resp = s.get(url, allow_redirects=True)
+                    for c in s.cookies.jar:
+                        if c.name in ("sso", "sso-rw"):
+                            all_cookies[f"{c.name}@{c.domain}"] = c.value
+                            all_cookies[c.name] = c.value
+                except Exception:
+                    continue
+
+        # 收集 grok.com 域名下的所有 cookies（包括 __cf_bm 等）
+        grok_cookies = {}
+        for c in s.cookies.jar:
+            if c.domain and "grok.com" in c.domain:
+                grok_cookies[c.name] = c.value
+        all_cookies["_grok_all"] = grok_cookies
+    return all_cookies
 
 def generate_random_name() -> str:
     length = random.randint(4, 6)
@@ -102,7 +164,7 @@ def verify_email_code_grpc(session, email, code):
 def register_single_thread():
     # 错峰启动，防止瞬时并发过高
     time.sleep(random.uniform(0, 5))
-    
+
     try:
         email_service = EmailService()
         turnstile_service = TurnstileService()
@@ -111,16 +173,22 @@ def register_single_thread():
     except Exception as e:
         print(f"[-] 服务初始化失败: {e}")
         return
-    
+
     # 修正：直接从 config 获取
     final_action_id = config["action_id"]
     if not final_action_id:
         print("[-] 线程退出：缺少 Action ID")
         return
-    
+
+    current_email_id = None  # 追踪当前邮箱ID，确保异常时能清理
+    current_email = None
+
     while True:
         try:
             if stop_event.is_set():
+                if current_email_id:
+                    try: email_service.delete_email(current_email_id)
+                    except: pass
                 return
             impersonate_fingerprint, account_user_agent = get_random_chrome_profile()
             with requests.Session(impersonate=impersonate_fingerprint, proxies=PROXIES) as session:
@@ -129,49 +197,53 @@ def register_single_thread():
                 except: pass
 
                 password = generate_random_string()
-                
-                # print(f"[debug] 线程-{threading.get_ident()} 正在请求创建邮箱...")
+
                 try:
-                    jwt, email = email_service.create_email()
+                    email_id, email = email_service.create_email()
+                    current_email_id = email_id
+                    current_email = email
                 except Exception as e:
                     print(f"[-] 邮箱服务抛出异常: {e}")
-                    jwt, email = None, None
+                    email_id, email, current_email_id, current_email = None, None, None, None
 
                 if not email:
                     time.sleep(5); continue
 
                 if stop_event.is_set():
-                    if email:
-                        email_service.delete_email(email)
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     return
-                
+
                 print(f"[*] 开始注册: {email}")
 
                 # Step 1: 发送验证码
                 if not send_email_code_grpc(session, email):
-                    email_service.delete_email(email)
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     time.sleep(5); continue
 
                 # Step 2: 获取验证码
-                verify_code = email_service.fetch_verification_code(email)
+                verify_code = email_service.fetch_verification_code(current_email_id)
                 if not verify_code:
-                    email_service.delete_email(email)
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     continue
 
                 # Step 3: 验证验证码
                 if not verify_email_code_grpc(session, email, verify_code):
-                    email_service.delete_email(email)
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     continue
-                
+
                 # Step 4: 注册重试循环
                 for attempt in range(3):
                     if stop_event.is_set():
-                        email_service.delete_email(email)
+                        email_service.delete_email(current_email_id)
+                        current_email_id, current_email = None, None
                         return
                     task_id = turnstile_service.create_task(site_url, config["site_key"])
-                    # 这里不再打印获取 Token 的过程，只在失败时报错
                     token = turnstile_service.get_response(task_id)
-                    
+
                     if not token or token == "CAPTCHA_FAIL":
                         continue
 
@@ -188,70 +260,105 @@ def register_single_thread():
                         },
                         "turnstileToken": token, "promptOnDuplicateEmail": True
                     }]
-                    
+
                     with post_lock:
                         res = session.post(f"{site_url}/sign-up", json=payload, headers=headers)
-                    
+
                     if res.status_code == 200:
-                        match = re.search(r'(https://[^" \s]+set-cookie\?q=[^:" \s]+)1:', res.text)
+                        # 从响应中提取 set-cookie URL
+                        match = re.search(r'(https://[^",\s]+set-cookie\?q=\S+?)(?:\d+:|")', res.text)
                         if not match:
-                            email_service.delete_email(email)
+                            print(f"[-] {email} 未找到set-cookie URL")
+                            email_service.delete_email(current_email_id)
+                            current_email_id, current_email = None, None
                             break
-                        if match:
-                            verify_url = match.group(1)
-                            session.get(verify_url, allow_redirects=True)
-                            sso = session.cookies.get("sso")
-                            sso_rw = session.cookies.get("sso-rw")
-                            if not sso:
-                                email_service.delete_email(email)
-                                break
+                        first_url = match.group(1)
+                        # 用新 session 逐层访问 set-cookie 链获取 SSO cookies
+                        cookies = _follow_set_cookie_chain(first_url, impersonate_fingerprint, PROXIES)
+                        sso = cookies.get("sso")
+                        sso_rw = cookies.get("sso-rw", sso or "")
+                        # grok.com 域名的 sso 和全部 cookies 用于 NSFW
+                        sso_grok = cookies.get("sso@.grok.com", sso)
+                        sso_rw_grok = cookies.get("sso-rw@.grok.com", sso_grok)
+                        grok_extra_cookies = cookies.get("_grok_all", {})
+                        if not sso:
+                            email_service.delete_email(current_email_id)
+                            current_email_id, current_email = None, None
+                            break
 
-                            tos_result = user_agreement_service.accept_tos_version(
-                                sso=sso,
-                                sso_rw=sso_rw or "",
-                                impersonate=impersonate_fingerprint,
-                                user_agent=account_user_agent,
-                            )
-                            tos_hex = tos_result.get("hex_reply") or ""
-                            if not tos_result.get("ok") or not tos_hex:
-                                email_service.delete_email(email)
-                                break
+                        tos_result = user_agreement_service.accept_tos_version(
+                            sso=sso,
+                            sso_rw=sso_rw,
+                            impersonate=impersonate_fingerprint,
+                            user_agent=account_user_agent,
+                            proxies=PROXIES,
+                        )
+                        tos_hex = tos_result.get("hex_reply") or ""
+                        if not tos_result.get("ok") or not tos_hex:
+                            email_service.delete_email(current_email_id)
+                            current_email_id, current_email = None, None
+                            break
 
-                            nsfw_result = nsfw_service.enable_nsfw(
-                                sso=sso,
-                                sso_rw=sso_rw or "",
-                                impersonate=impersonate_fingerprint,
-                                user_agent=account_user_agent,
-                            )
-                            nsfw_hex = nsfw_result.get("hex_reply") or ""
-                            if not nsfw_result.get("ok") or not nsfw_hex:
-                                email_service.delete_email(email)
-                                break
+                        nsfw_result = nsfw_service.enable_nsfw(
+                            sso=sso_grok,
+                            sso_rw=sso_rw_grok,
+                            impersonate=impersonate_fingerprint,
+                            user_agent=account_user_agent,
+                            proxies=PROXIES,
+                        )
+                        nsfw_ok = nsfw_result.get("ok", False)
+                        if not nsfw_ok:
+                            pass  # NSFW 失败不阻断注册流程
 
-                            with file_lock:
-                                global success_count
-                                if success_count >= target_count:
-                                    if not stop_event.is_set():
-                                        stop_event.set()
-                                    email_service.delete_email(email)
-                                    break
-                                with open(output_file, "a") as f: f.write(sso + "\n")
-                                success_count += 1
-                                avg = (time.time() - start_time) / success_count
-                                print(f"[+] {success_count}/{target_count} {email} | {avg:.1f}s/个")
-                                email_service.delete_email(email)
-                                if success_count >= target_count and not stop_event.is_set():
+                        # 立即进行二次验证 (enable_unhinged)
+                        unhinged_result = nsfw_service.enable_unhinged(sso_grok, proxies=PROXIES)
+                        unhinged_ok = unhinged_result.get("ok", False)
+
+                        with file_lock:
+                            global success_count
+                            if success_count >= target_count:
+                                if not stop_event.is_set():
                                     stop_event.set()
-                            break  # 跳出 for 循环，继续 while True 注册下一个
+                                print(f"[*] 已达到目标数量，删除邮箱: {email}")
+                                email_service.delete_email(current_email_id)
+                                current_email_id, current_email = None, None
+                                break
+                            try:
+                                import csv as _csv
+                                nsfw_val = "yes" if unhinged_ok else "no"
+                                with open(output_file, "a", newline="", encoding="utf-8") as f:
+                                    _csv.writer(f).writerow([sso, "ssoBasic", nsfw_val, email])
+                            except Exception as write_err:
+                                print(f"[-] 写入文件失败: {write_err}")
+                                email_service.delete_email(current_email_id)
+                                current_email_id, current_email = None, None
+                                break
+                            success_count += 1
+                            avg = (time.time() - start_time) / success_count
+                            nsfw_tag = "Y" if unhinged_ok else "N"
+                            print(f"[OK] 注册成功: {success_count}/{target_count} | {email} | SSO: {sso[:15]}... | 平均: {avg:.1f}s | NSFW: {nsfw_tag}")
+                            email_service.delete_email(current_email_id)
+                            current_email_id, current_email = None, None
+                            if success_count >= target_count and not stop_event.is_set():
+                                stop_event.set()
+                                print(f"[*] 已达到目标数量: {success_count}/{target_count}，停止新注册")
+                        break  # 跳出 for 循环，继续 while True 注册下一个
 
                     time.sleep(3)
                 else:
                     # 如果重试 3 次都失败 (for 循环没有被 break)
-                    email_service.delete_email(email)
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     time.sleep(5)
 
         except Exception as e:
             print(f"[-] 异常: {str(e)[:50]}")
+            if current_email_id:
+                try:
+                    email_service.delete_email(current_email_id)
+                except:
+                    pass
+                current_email_id, current_email = None, None
             time.sleep(5)
 
 def main():
@@ -260,7 +367,7 @@ def main():
     # 1. 扫描参数
     print("[*] 正在初始化...")
     start_url = f"{site_url}/sign-up"
-    with requests.Session(impersonate=DEFAULT_IMPERSONATE) as s:
+    with requests.Session(impersonate=DEFAULT_IMPERSONATE, proxies=PROXIES) as s:
         try:
             html = s.get(start_url).text
             # Key
@@ -299,29 +406,19 @@ def main():
     global target_count, output_file
     target_count = max(1, total)
 
+    import csv as _csv
     from datetime import datetime
     os.makedirs("keys", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"keys/grok_{timestamp}_{target_count}.txt"
+    output_file = f"keys/grok_{timestamp}_{target_count}.csv"
+    with open(output_file, "w", newline="", encoding="utf-8") as f:
+        _csv.writer(f).writerow(["token", "pool", "nsfw", "email"])
 
     print(f"[*] 启动 {t} 个线程，目标 {target_count} 个")
     print(f"[*] 输出: {output_file}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=t) as executor:
         futures = [executor.submit(register_single_thread) for _ in range(t)]
         concurrent.futures.wait(futures)
-
-    # 二次验证 NSFW
-    if os.path.exists(output_file):
-        print(f"\n[*] 开始二次验证 NSFW...")
-        nsfw_service = NsfwSettingsService()
-        with open(output_file, "r") as f:
-            tokens = [line.strip() for line in f if line.strip()]
-        ok_count = 0
-        for sso in tokens:
-            result = nsfw_service.enable_unhinged(sso)
-            if result.get("ok"):
-                ok_count += 1
-        print(f"[*] 二次验证完成: {ok_count}/{len(tokens)}")
 
 if __name__ == "__main__":
     main()

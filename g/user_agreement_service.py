@@ -25,6 +25,7 @@ class UserAgreementService:
         user_agent: Optional[str] = None,
         cf_clearance: Optional[str] = None,
         timeout: int = 15,
+        proxies: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         同意 TOS 版本。
@@ -44,20 +45,11 @@ class UserAgreementService:
                 "grpc_status": None,
                 "error": "缺少 sso",
             }
-        if not sso_rw:
-            return {
-                "ok": False,
-                "hex_reply": "",
-                "status_code": None,
-                "grpc_status": None,
-                "error": "缺少 sso-rw",
-            }
-
         url = "https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion"
 
         cookies = {
             "sso": sso,
-            "sso-rw": sso_rw,
+            "sso-rw": sso_rw or sso,
         }
         clearance = (cf_clearance if cf_clearance is not None else self.cf_clearance).strip()
         if clearance:
@@ -85,6 +77,7 @@ class UserAgreementService:
                 data=data,
                 impersonate=impersonate or "chrome120",
                 timeout=timeout,
+                proxies=proxies or {},
             )
             hex_reply = response.content.hex()
             grpc_status = response.headers.get("grpc-status")

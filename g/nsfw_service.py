@@ -25,6 +25,8 @@ class NsfwSettingsService:
         user_agent: Optional[str] = None,
         cf_clearance: Optional[str] = None,
         timeout: int = 15,
+        proxies: Optional[Dict[str, str]] = None,
+        extra_cookies: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         启用 always_show_nsfw_content。
@@ -44,21 +46,13 @@ class NsfwSettingsService:
                 "grpc_status": None,
                 "error": "缺少 sso",
             }
-        if not sso_rw:
-            return {
-                "ok": False,
-                "hex_reply": "",
-                "status_code": None,
-                "grpc_status": None,
-                "error": "缺少 sso-rw",
-            }
-
         url = "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
 
-        cookies = {
-            "sso": sso,
-            "sso-rw": sso_rw,
-        }
+        cookies = {}
+        if extra_cookies:
+            cookies.update(extra_cookies)
+        cookies["sso"] = sso
+        cookies["sso-rw"] = sso_rw or sso
         clearance = (cf_clearance if cf_clearance is not None else self.cf_clearance).strip()
         if clearance:
             cookies["cf_clearance"] = clearance
@@ -88,6 +82,7 @@ class NsfwSettingsService:
                 data=data,
                 impersonate=impersonate or "chrome120",
                 timeout=timeout,
+                proxies=proxies or {},
             )
             hex_reply = response.content.hex()
             grpc_status = response.headers.get("grpc-status")
@@ -123,6 +118,8 @@ class NsfwSettingsService:
         impersonate: str = "chrome120",
         user_agent: Optional[str] = None,
         timeout: int = 30,
+        proxies: Optional[Dict[str, str]] = None,
+        extra_cookies: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         使用帖子方法开启 Unhinged 模式（二次验证）。
@@ -139,7 +136,10 @@ class NsfwSettingsService:
             "user-agent": user_agent or DEFAULT_USER_AGENT,
             "x-grpc-web": "1",
             "x-user-agent": "connect-es/2.1.1",
-            "cookie": f"sso={sso}; sso-rw={sso}"
+            "cookie": "; ".join(
+                [f"{k}={v}" for k, v in (extra_cookies or {}).items()]
+                + [f"sso={sso}", f"sso-rw={sso}"]
+            )
         }
 
         payload = bytes([0x08, 0x01, 0x10, 0x01])
@@ -152,6 +152,7 @@ class NsfwSettingsService:
                 data=data,
                 impersonate=impersonate,
                 timeout=timeout,
+                proxies=proxies or {},
             )
             return {
                 "ok": response.status_code == 200,
