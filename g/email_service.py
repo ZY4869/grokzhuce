@@ -53,11 +53,14 @@ class EmailService:
         self._domains = ["moemail.app"]
         return self._domains
 
-    def create_email(self):
+    def create_email(self, domain_override=None):
         """创建临时邮箱 POST /api/emails/generate"""
         try:
-            domains = self._get_domains()
-            domain = random.choice(domains)
+            if domain_override:
+                domain = domain_override
+            else:
+                domains = self._get_domains()
+                domain = random.choice(domains)
             name = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
             res = requests.post(
                 f"{self.BASE_URL}/emails/generate",

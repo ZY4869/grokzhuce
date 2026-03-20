@@ -46,7 +46,7 @@ class NsfwSettingsService:
                 "grpc_status": None,
                 "error": "缺少 sso",
             }
-        url = "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
+        url = "https://accounts.x.ai/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
 
         cookies = {}
         if extra_cookies:
@@ -115,6 +115,7 @@ class NsfwSettingsService:
     def enable_unhinged(
         self,
         sso: str,
+        sso_rw: Optional[str] = None,
         impersonate: str = "chrome120",
         user_agent: Optional[str] = None,
         timeout: int = 30,
@@ -126,7 +127,7 @@ class NsfwSettingsService:
         """
         import struct
 
-        url = "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
+        url = "https://accounts.x.ai/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
 
         headers = {
             "accept": "*/*",
@@ -138,7 +139,7 @@ class NsfwSettingsService:
             "x-user-agent": "connect-es/2.1.1",
             "cookie": "; ".join(
                 [f"{k}={v}" for k, v in (extra_cookies or {}).items()]
-                + [f"sso={sso}", f"sso-rw={sso}"]
+                + [f"sso={sso}", f"sso-rw={sso_rw or sso}"]
             )
         }
 

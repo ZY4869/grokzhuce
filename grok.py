@@ -46,6 +46,8 @@ config = {
     "state_tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22sign-up%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Fsign-up%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
 }
 
+FLARESOLVERR_URL = "http://localhost:8191/v1"
+
 post_lock = threading.Lock()
 file_lock = threading.Lock()
 success_count = 0
@@ -53,6 +55,35 @@ start_time = time.time()
 target_count = 100
 stop_event = threading.Event()
 output_file = None
+NSFW_ENABLE_RETRIES = 3
+
+def _get_cf_clearance_via_flaresolverr(target_url="https://grok.com", timeout=120):
+    """通过 FlareSolverr 获取 cf_clearance cookie。"""
+    import urllib.request, urllib.error
+    payload = json.dumps({
+        "cmd": "request.get",
+        "url": target_url,
+        "maxTimeout": timeout * 1000,
+        "proxy": {"url": PROXIES.get("http", "")},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        FLARESOLVERR_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout + 10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("status") == "ok":
+            cookies = data.get("solution", {}).get("cookies", [])
+            for c in cookies:
+                if c.get("name") == "cf_clearance":
+                    print(f"[+] FlareSolverr 获取 cf_clearance 成功")
+                    return c["value"]
+        print(f"[-] FlareSolverr 未返回 cf_clearance: {data.get('status')}")
+    except Exception as e:
+        print(f"[-] FlareSolverr 请求失败: {e}")
+    return None
 
 def _decode_jwt_payload(jwt_token):
     """解码 JWT payload 部分"""
@@ -115,6 +146,47 @@ def _follow_set_cookie_chain(first_url, impersonate, proxies):
                 grok_cookies[c.name] = c.value
         all_cookies["_grok_all"] = grok_cookies
     return all_cookies
+
+def _enable_default_nsfw(nsfw_service, sso, sso_rw, impersonate, user_agent, extra_cookies):
+    """确保新注册账号在写出前已默认开启 NSFW。遇到 403 时尝试通过 FlareSolverr 获取 cf_clearance。"""
+    last_error = "unknown"
+    cf_clearance = None
+    for attempt in range(1, NSFW_ENABLE_RETRIES + 1):
+        nsfw_result = nsfw_service.enable_nsfw(
+            sso=sso,
+            sso_rw=sso_rw,
+            impersonate=impersonate,
+            user_agent=user_agent,
+            proxies=PROXIES,
+            extra_cookies=extra_cookies,
+            cf_clearance=cf_clearance,
+        )
+        if not nsfw_result.get("ok", False):
+            last_error = nsfw_result.get("error") or f"status={nsfw_result.get('status_code')}"
+            # 遇到 403 时尝试 FlareSolverr 获取 cf_clearance
+            if nsfw_result.get("status_code") == 403 and not cf_clearance:
+                print(f"[*] NSFW 遇到 403，尝试 FlareSolverr 绕过 Cloudflare...")
+                cf_clearance = _get_cf_clearance_via_flaresolverr()
+                if cf_clearance:
+                    extra_cookies = dict(extra_cookies or {})
+                    extra_cookies["cf_clearance"] = cf_clearance
+            time.sleep(1)
+            continue
+
+        unhinged_result = nsfw_service.enable_unhinged(
+            sso=sso,
+            sso_rw=sso_rw,
+            impersonate=impersonate,
+            user_agent=user_agent,
+            proxies=PROXIES,
+            extra_cookies=extra_cookies,
+        )
+        if unhinged_result.get("ok", False):
+            return True, attempt, None
+
+        last_error = unhinged_result.get("error") or f"status={unhinged_result.get('status_code')}"
+        time.sleep(1)
+    return False, NSFW_ENABLE_RETRIES, last_error
 
 def generate_random_name() -> str:
     length = random.randint(4, 6)
@@ -198,16 +270,20 @@ def register_single_thread():
 
                 password = generate_random_string()
 
-                try:
-                    email_id, email = email_service.create_email()
-                    current_email_id = email_id
-                    current_email = email
-                except Exception as e:
-                    print(f"[-] 邮箱服务抛出异常: {e}")
-                    email_id, email, current_email_id, current_email = None, None, None, None
+                # 复用邮箱：仅在没有邮箱时创建新的
+                if not current_email:
+                    try:
+                        email_id, email = email_service.create_email()
+                        current_email_id = email_id
+                        current_email = email
+                    except Exception as e:
+                        print(f"[-] 邮箱服务抛出异常: {e}")
+                        email_id, email, current_email_id, current_email = None, None, None, None
 
-                if not email:
-                    time.sleep(5); continue
+                    if not email:
+                        time.sleep(5); continue
+                else:
+                    email = current_email
 
                 if stop_event.is_set():
                     email_service.delete_email(current_email_id)
@@ -218,21 +294,18 @@ def register_single_thread():
 
                 # Step 1: 发送验证码
                 if not send_email_code_grpc(session, email):
-                    email_service.delete_email(current_email_id)
-                    current_email_id, current_email = None, None
+                    print(f"[-] {email} 发送验证码失败，稍后复用邮箱重试")
                     time.sleep(5); continue
 
                 # Step 2: 获取验证码
                 verify_code = email_service.fetch_verification_code(current_email_id)
                 if not verify_code:
-                    email_service.delete_email(current_email_id)
-                    current_email_id, current_email = None, None
+                    print(f"[-] {email} 获取验证码失败，复用邮箱重试")
                     continue
 
                 # Step 3: 验证验证码
                 if not verify_email_code_grpc(session, email, verify_code):
-                    email_service.delete_email(current_email_id)
-                    current_email_id, current_email = None, None
+                    print(f"[-] {email} 验证码校验失败，复用邮箱重试")
                     continue
 
                 # Step 4: 注册重试循环
@@ -268,9 +341,7 @@ def register_single_thread():
                         # 从响应中提取 set-cookie URL
                         match = re.search(r'(https://[^",\s]+set-cookie\?q=\S+?)(?:\d+:|")', res.text)
                         if not match:
-                            print(f"[-] {email} 未找到set-cookie URL")
-                            email_service.delete_email(current_email_id)
-                            current_email_id, current_email = None, None
+                            print(f"[-] {email} 未找到set-cookie URL，复用邮箱重试")
                             break
                         first_url = match.group(1)
                         # 用新 session 逐层访问 set-cookie 链获取 SSO cookies
@@ -282,8 +353,7 @@ def register_single_thread():
                         sso_rw_grok = cookies.get("sso-rw@.grok.com", sso_grok)
                         grok_extra_cookies = cookies.get("_grok_all", {})
                         if not sso:
-                            email_service.delete_email(current_email_id)
-                            current_email_id, current_email = None, None
+                            print(f"[-] {email} 未获取到SSO，复用邮箱重试")
                             break
 
                         tos_result = user_agreement_service.accept_tos_version(
@@ -295,24 +365,20 @@ def register_single_thread():
                         )
                         tos_hex = tos_result.get("hex_reply") or ""
                         if not tos_result.get("ok") or not tos_hex:
-                            email_service.delete_email(current_email_id)
-                            current_email_id, current_email = None, None
+                            print(f"[-] {email} TOS接受失败，复用邮箱重试")
                             break
 
-                        nsfw_result = nsfw_service.enable_nsfw(
+                        nsfw_ok, nsfw_attempts, nsfw_error = _enable_default_nsfw(
+                            nsfw_service=nsfw_service,
                             sso=sso_grok,
                             sso_rw=sso_rw_grok,
                             impersonate=impersonate_fingerprint,
                             user_agent=account_user_agent,
-                            proxies=PROXIES,
+                            extra_cookies=grok_extra_cookies,
                         )
-                        nsfw_ok = nsfw_result.get("ok", False)
+                        nsfw_label = "yes" if nsfw_ok else "no"
                         if not nsfw_ok:
-                            pass  # NSFW 失败不阻断注册流程
-
-                        # 立即进行二次验证 (enable_unhinged)
-                        unhinged_result = nsfw_service.enable_unhinged(sso_grok, proxies=PROXIES)
-                        unhinged_ok = unhinged_result.get("ok", False)
+                            print(f"[-] {email} NSFW 开启失败({nsfw_attempts}次): {nsfw_error}，账号仍保存(nsfw=no)")
 
                         with file_lock:
                             global success_count
@@ -325,9 +391,8 @@ def register_single_thread():
                                 break
                             try:
                                 import csv as _csv
-                                nsfw_val = "yes" if unhinged_ok else "no"
                                 with open(output_file, "a", newline="", encoding="utf-8") as f:
-                                    _csv.writer(f).writerow([sso, "ssoBasic", nsfw_val, email])
+                                    _csv.writer(f).writerow([sso, "ssoBasic", nsfw_label, email])
                             except Exception as write_err:
                                 print(f"[-] 写入文件失败: {write_err}")
                                 email_service.delete_email(current_email_id)
@@ -335,8 +400,7 @@ def register_single_thread():
                                 break
                             success_count += 1
                             avg = (time.time() - start_time) / success_count
-                            nsfw_tag = "Y" if unhinged_ok else "N"
-                            print(f"[OK] 注册成功: {success_count}/{target_count} | {email} | SSO: {sso[:15]}... | 平均: {avg:.1f}s | NSFW: {nsfw_tag}")
+                            print(f"[OK] 注册成功: {success_count}/{target_count} | {email} | SSO: {sso[:15]}... | 平均: {avg:.1f}s | NSFW: {nsfw_label.upper()}")
                             email_service.delete_email(current_email_id)
                             current_email_id, current_email = None, None
                             if success_count >= target_count and not stop_event.is_set():
@@ -346,19 +410,12 @@ def register_single_thread():
 
                     time.sleep(3)
                 else:
-                    # 如果重试 3 次都失败 (for 循环没有被 break)
-                    email_service.delete_email(current_email_id)
-                    current_email_id, current_email = None, None
+                    # 如果重试 3 次都失败 (for 循环没有被 break)，复用邮箱
+                    print(f"[-] {email} 注册重试3次均失败，复用邮箱继续")
                     time.sleep(5)
 
         except Exception as e:
-            print(f"[-] 异常: {str(e)[:50]}")
-            if current_email_id:
-                try:
-                    email_service.delete_email(current_email_id)
-                except:
-                    pass
-                current_email_id, current_email = None, None
+            print(f"[-] 异常: {str(e)[:50]}，复用邮箱重试")
             time.sleep(5)
 
 def main():
@@ -396,23 +453,22 @@ def main():
 
     # 2. 启动
     try:
-        t = int(input("\n并发数 (默认8): ").strip() or 8)
-    except: t = 8
+        t = int(input("\n并发数 (默认1): ").strip() or 1)
+    except: t = 1
 
     try:
-        total = int(input("注册数量 (默认100): ").strip() or 100)
-    except: total = 100
+        total = int(input("注册数量 (默认1): ").strip() or 1)
+    except: total = 1
 
     global target_count, output_file
     target_count = max(1, total)
 
     import csv as _csv
-    from datetime import datetime
     os.makedirs("keys", exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"keys/grok_{timestamp}_{target_count}.csv"
-    with open(output_file, "w", newline="", encoding="utf-8") as f:
-        _csv.writer(f).writerow(["token", "pool", "nsfw", "email"])
+    output_file = "keys/grok_accounts.csv"
+    if not os.path.exists(output_file):
+        with open(output_file, "w", newline="", encoding="utf-8") as f:
+            _csv.writer(f).writerow(["token", "pool", "nsfw", "email"])
 
     print(f"[*] 启动 {t} 个线程，目标 {target_count} 个")
     print(f"[*] 输出: {output_file}")
