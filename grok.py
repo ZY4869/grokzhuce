@@ -270,20 +270,16 @@ def register_single_thread():
 
                 password = generate_random_string()
 
-                # 复用邮箱：仅在没有邮箱时创建新的
-                if not current_email:
-                    try:
-                        email_id, email = email_service.create_email()
-                        current_email_id = email_id
-                        current_email = email
-                    except Exception as e:
-                        print(f"[-] 邮箱服务抛出异常: {e}")
-                        email_id, email, current_email_id, current_email = None, None, None, None
+                try:
+                    email_id, email = email_service.create_email()
+                    current_email_id = email_id
+                    current_email = email
+                except Exception as e:
+                    print(f"[-] 邮箱服务抛出异常: {e}")
+                    email_id, email, current_email_id, current_email = None, None, None, None
 
-                    if not email:
-                        time.sleep(5); continue
-                else:
-                    email = current_email
+                if not email:
+                    time.sleep(5); continue
 
                 if stop_event.is_set():
                     email_service.delete_email(current_email_id)
@@ -294,18 +290,21 @@ def register_single_thread():
 
                 # Step 1: 发送验证码
                 if not send_email_code_grpc(session, email):
-                    print(f"[-] {email} 发送验证码失败，稍后复用邮箱重试")
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     time.sleep(5); continue
 
                 # Step 2: 获取验证码
                 verify_code = email_service.fetch_verification_code(current_email_id)
                 if not verify_code:
-                    print(f"[-] {email} 获取验证码失败，复用邮箱重试")
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     continue
 
                 # Step 3: 验证验证码
                 if not verify_email_code_grpc(session, email, verify_code):
-                    print(f"[-] {email} 验证码校验失败，复用邮箱重试")
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     continue
 
                 # Step 4: 注册重试循环
@@ -341,7 +340,9 @@ def register_single_thread():
                         # 从响应中提取 set-cookie URL
                         match = re.search(r'(https://[^",\s]+set-cookie\?q=\S+?)(?:\d+:|")', res.text)
                         if not match:
-                            print(f"[-] {email} 未找到set-cookie URL，复用邮箱重试")
+                            print(f"[-] {email} 未找到set-cookie URL")
+                            email_service.delete_email(current_email_id)
+                            current_email_id, current_email = None, None
                             break
                         first_url = match.group(1)
                         # 用新 session 逐层访问 set-cookie 链获取 SSO cookies
@@ -410,12 +411,19 @@ def register_single_thread():
 
                     time.sleep(3)
                 else:
-                    # 如果重试 3 次都失败 (for 循环没有被 break)，复用邮箱
-                    print(f"[-] {email} 注册重试3次均失败，复用邮箱继续")
+                    # 如果重试 3 次都失败 (for 循环没有被 break)
+                    email_service.delete_email(current_email_id)
+                    current_email_id, current_email = None, None
                     time.sleep(5)
 
         except Exception as e:
-            print(f"[-] 异常: {str(e)[:50]}，复用邮箱重试")
+            print(f"[-] 异常: {str(e)[:50]}")
+            if current_email_id:
+                try:
+                    email_service.delete_email(current_email_id)
+                except:
+                    pass
+                current_email_id, current_email = None, None
             time.sleep(5)
 
 def main():
